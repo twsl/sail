@@ -81,6 +81,74 @@ Feature: zip_with higher-order function
         | result     |
         | [10, 20]   |
 
+  Rule: Ordinary expressions are bound as lambdas that ignore their parameters
+
+    Scenario: Use a constant expression as the body
+      When query
+        """
+        SELECT zip_with(array(1, 2), array(3), 5) AS result
+        """
+      Then query result
+        | result |
+        | [5, 5] |
+
+    Scenario: Preserve an enclosing lambda capture
+      When query
+        """
+        SELECT transform(array(1, 2), x -> zip_with(array(10), array(20, 30), x)) AS result
+        """
+      Then query result collected
+        | result             |
+        | [[1, 1], [2, 2]]   |
+
+    Scenario: Preserve a captured column for each zipped element
+      When query
+        """
+        SELECT zip_with(left_array, right_array, captured) AS result
+        FROM VALUES (array(10), array(20, 30), 1), (array(11), array(40, 50), 2)
+          AS t(left_array, right_array, captured)
+        """
+      Then query result
+        | result  |
+        | [1, 1] |
+        | [2, 2] |
+
+    Scenario: Preserve zipped length with a constant body in an enclosing lambda
+      When query
+        """
+        SELECT transform(array(1, 2), x -> zip_with(array(10), array(20, 30), 5)) AS result
+        """
+      Then query result
+        | result               |
+        | [[5, 5], [5, 5]]     |
+
+    Scenario: Preserve an enclosing lambda capture with an explicit lambda
+      When query
+        """
+        SELECT transform(array(1, 2), x -> zip_with(array(10), array(20, 30), (a, b) -> x)) AS result
+        """
+      Then query result
+        | result     |
+        | [[1, 1], [2, 2]] |
+
+    Scenario: A NULL body remains NULL for each zipped element
+      When query
+        """
+        SELECT zip_with(array(1, 2), array(3, 4), NULL) AS result
+        """
+      Then query result
+        | result       |
+        | [NULL, NULL] |
+
+    Scenario: An untyped NULL input with an ordinary body returns NULL
+      When query
+        """
+        SELECT zip_with(NULL, array(1, 2), 5) AS result
+        """
+      Then query result
+        | result |
+        | NULL   |
+
   Rule: Empty and NULL arrays
 
     Scenario: Zip two typed empty arrays

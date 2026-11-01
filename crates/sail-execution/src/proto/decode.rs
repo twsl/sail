@@ -263,8 +263,12 @@ pub(super) fn try_decode_higher_order_udf(
         HigherOrderUdfKind::ZipWith(r#gen::SparkArrayZipWithUdf {}) => {
             Arc::new(HigherOrderUDF::new_from_impl(SparkArrayZipWith::new()))
         }
-        HigherOrderUdfKind::MapZipWith(r#gen::SparkMapZipWithUdf {}) => {
-            Arc::new(HigherOrderUDF::new_from_impl(SparkMapZipWith::new()))
-        }
+        HigherOrderUdfKind::MapZipWith(r#gen::SparkMapZipWithUdf {
+            ansi_mode,
+            session_timezone,
+        }) => Arc::new(HigherOrderUDF::new_from_impl(SparkMapZipWith::new(
+            ansi_mode,
+            Arc::from(session_timezone),
+        ))),
     })
 }

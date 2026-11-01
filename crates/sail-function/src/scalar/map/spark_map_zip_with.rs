@@ -16,21 +16,23 @@ use datafusion_expr::{
     HigherOrderUDFImpl, LambdaParametersProgress, ValueOrLambda, Volatility,
 };
 use sail_common::spec::{SAIL_MAP_FIELD_NAME, SAIL_MAP_KEY_FIELD_NAME, SAIL_MAP_VALUE_FIELD_NAME};
-use sail_common_datafusion::type_coercion::binary_type_coercion::comparison_coercion;
+use sail_common_datafusion::type_coercion::binary_type_coercion::set_operation_coercion;
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkMapZipWith {
     signature: HigherOrderSignature,
+    ansi_mode: bool,
+    session_timezone: Arc<str>,
 }
 
 impl Default for SparkMapZipWith {
     fn default() -> Self {
-        Self::new()
+        Self::new(true, Arc::from("UTC"))
     }
 }
 
 impl SparkMapZipWith {
-    pub fn new() -> Self {
+    pub fn new(ansi_mode: bool, session_timezone: Arc<str>) -> Self {
         Self {
             signature: HigherOrderSignature::exact(
                 vec![
@@ -40,7 +42,17 @@ impl SparkMapZipWith {
                 ],
                 Volatility::Immutable,
             ),
+            ansi_mode,
+            session_timezone,
         }
+    }
+
+    pub fn ansi_mode(&self) -> bool {
+        self.ansi_mode
+    }
+
+    pub fn session_timezone(&self) -> &str {
+        &self.session_timezone
     }
 }
 
@@ -75,7 +87,13 @@ impl HigherOrderUDFImpl for SparkMapZipWith {
         let (left, right, _lambda) = map_zip_args(self.name(), fields)?;
         let (left_key, left_value, _) = map_fields(self.name(), left)?;
         let (right_key, _right_value, _) = map_fields(self.name(), right)?;
-        let key_type = common_map_key_type(self.name(), &left_key, &right_key)?;
+        let key_type = common_map_key_type(
+            self.name(),
+            &left_key,
+            &right_key,
+            self.ansi_mode,
+            &self.session_timezone,
+        )?;
         Ok(LambdaParametersProgress::Complete(vec![vec![
             Arc::new(
                 left_key
@@ -99,7 +117,13 @@ impl HigherOrderUDFImpl for SparkMapZipWith {
         let (left, right, lambda) = map_zip_args(self.name(), args.arg_fields)?;
         let (left_key, _, _) = map_fields(self.name(), left)?;
         let (right_key, _, _) = map_fields(self.name(), right)?;
-        let key_type = common_map_key_type(self.name(), &left_key, &right_key)?;
+        let key_type = common_map_key_type(
+            self.name(),
+            &left_key,
+            &right_key,
+            self.ansi_mode,
+            &self.session_timezone,
+        )?;
         let fields = Fields::from(vec![
             Field::new(SAIL_MAP_KEY_FIELD_NAME, key_type, false),
             Field::new(
@@ -180,7 +204,13 @@ impl HigherOrderUDFImpl for SparkMapZipWith {
         };
         let (left_key, _, _) = map_fields_from_type(self.name(), left, "first")?;
         let (right_key, _, _) = map_fields_from_type(self.name(), right, "second")?;
-        let key_type = common_map_key_type(self.name(), &left_key, &right_key)?;
+        let key_type = common_map_key_type(
+            self.name(),
+            &left_key,
+            &right_key,
+            self.ansi_mode,
+            &self.session_timezone,
+        )?;
         Ok(vec![
             map_type_with_key_type(self.name(), left, &key_type)?,
             map_type_with_key_type(self.name(), right, &key_type)?,
@@ -228,8 +258,20 @@ fn map_fields_from_type(
     Ok((Arc::clone(key), Arc::clone(value), *ordered))
 }
 
-fn common_map_key_type(name: &str, left: &FieldRef, right: &FieldRef) -> Result<DataType> {
-    comparison_coercion(left.data_type(), right.data_type()).ok_or_else(|| {
+fn common_map_key_type(
+    name: &str,
+    left: &FieldRef,
+    right: &FieldRef,
+    ansi_mode: bool,
+    session_timezone: &str,
+) -> Result<DataType> {
+    set_operation_coercion(
+        left.data_type(),
+        right.data_type(),
+        ansi_mode,
+        session_timezone,
+    )
+    .ok_or_else(|| {
         datafusion_common::DataFusionError::Plan(format!(
             "{name} expected maps with compatible key types, got {} and {}",
             left.data_type(),
@@ -476,14 +518,32 @@ mod tests {
             ValueOrLambda::Lambda(Arc::new(Field::new("", DataType::Int32, true))),
         ];
         let scalar_arguments = [None, None, None];
-        let result = SparkMapZipWith::new().return_field_from_args(HigherOrderReturnFieldArgs {
-            arg_fields: &fields,
-            scalar_arguments: &scalar_arguments,
-        })?;
+        let result = SparkMapZipWith::new(false, Arc::from("UTC")).return_field_from_args(
+            HigherOrderReturnFieldArgs {
+                arg_fields: &fields,
+                scalar_arguments: &scalar_arguments,
+            },
+        )?;
         let DataType::Map(_, sorted) = result.data_type() else {
             return exec_err!("map_zip_with return type is not a map");
         };
         assert!(!sorted);
+        Ok(())
+    }
+
+    #[test]
+    fn widens_map_keys_according_to_ansi_mode() -> Result<()> {
+        let left = Arc::new(Field::new("key", DataType::Utf8, false));
+        let right = Arc::new(Field::new("key", DataType::Int32, false));
+
+        assert_eq!(
+            common_map_key_type("map_zip_with", &left, &right, false, "UTC")?,
+            DataType::Utf8
+        );
+        assert_eq!(
+            common_map_key_type("map_zip_with", &left, &right, true, "UTC")?,
+            DataType::Int64
+        );
         Ok(())
     }
 

@@ -118,6 +118,81 @@ Feature: map_zip_with higher-order function
         | result |
         | {}     |
 
+  Rule: Ordinary expressions are bound as lambdas that ignore their parameters
+
+    Scenario: Use a constant expression as the body
+      When query
+        """
+        SELECT map_zip_with(map('a', 1), map('b', 2), 5) AS result
+        """
+      Then query result
+        | result           |
+        | {a -> 5, b -> 5} |
+
+    Scenario: An untyped NULL input with an ordinary body returns NULL
+      When query
+        """
+        SELECT map_zip_with(NULL, map('a', 1), 5) AS result
+        """
+      Then query result
+        | result |
+        | NULL   |
+
+  Rule: Map key widening follows ANSI mode
+
+    Scenario: Non-ANSI mode preserves distinct string and integer keys
+      Given config spark.sql.ansi.enabled = false
+      When query
+        """
+        SELECT map_keys(map_zip_with(
+          map('01', 10), map(1, 20), (k, v1, v2) -> coalesce(v1, 0) + coalesce(v2, 0)
+        )) AS result
+        """
+      Then query result
+        | result  |
+        | [01, 1] |
+
+    Scenario: ANSI mode promotes string timestamp keys in the session time zone
+      Given config spark.sql.ansi.enabled = true
+      And config spark.sql.session.timeZone = America/Los_Angeles
+      When query
+        """
+        SELECT size(map_zip_with(
+          map('2020-06-14 12:00:00', 10),
+          map(TIMESTAMP '2020-06-14 12:00:00', 20),
+          (k, v1, v2) -> coalesce(v1, 0) + coalesce(v2, 0)
+        )) AS result
+        """
+      Then query result
+        | result |
+        | 1      |
+
+    Scenario: Align LTZ and NTZ timestamp keys in the session time zone
+      Given config spark.sql.session.timeZone = America/Los_Angeles
+      When query
+        """
+        SELECT size(map_zip_with(
+          map(TIMESTAMP_NTZ '2020-06-14 12:00:00', 10),
+          map(TIMESTAMP '2020-06-14 12:00:00', 20),
+          (k, v1, v2) -> coalesce(v1, 0) + coalesce(v2, 0)
+        )) AS result
+        """
+      Then query result
+        | result |
+        | 1      |
+
+    Scenario: ANSI mode coerces string and integer keys to a common integer type
+      Given config spark.sql.ansi.enabled = true
+      When query
+        """
+        SELECT map_keys(map_zip_with(
+          map('01', 10), map(1, 20), (k, v1, v2) -> coalesce(v1, 0) + coalesce(v2, 0)
+        )) AS result
+        """
+      Then query result
+        | result |
+        | [1]    |
+
     Scenario: A NULL map input returns NULL
       When query
         """

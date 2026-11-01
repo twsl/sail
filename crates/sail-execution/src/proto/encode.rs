@@ -206,8 +206,11 @@ pub(super) fn try_encode_higher_order_udf(
         })
     } else if udf_inner.is::<SparkArrayZipWith>() {
         HigherOrderUdfKind::ZipWith(r#gen::SparkArrayZipWithUdf {})
-    } else if udf_inner.is::<SparkMapZipWith>() {
-        HigherOrderUdfKind::MapZipWith(r#gen::SparkMapZipWithUdf {})
+    } else if let Some(map_zip_with) = udf_inner.downcast_ref::<SparkMapZipWith>() {
+        HigherOrderUdfKind::MapZipWith(r#gen::SparkMapZipWithUdf {
+            ansi_mode: map_zip_with.ansi_mode(),
+            session_timezone: map_zip_with.session_timezone().to_owned(),
+        })
     } else {
         return plan_err!("unsupported higher-order function: {}", hof.name());
     };

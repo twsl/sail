@@ -8146,7 +8146,10 @@ mod tests {
             Some(Arc::new(Field::new("v2", DataType::Int32, true))),
         ));
         let logical = Expr::HigherOrderFunction(HigherOrderFunction::new(
-            Arc::new(HigherOrderUDF::new_from_impl(SparkMapZipWith::new())),
+            Arc::new(HigherOrderUDF::new_from_impl(SparkMapZipWith::new(
+                false,
+                Arc::from("America/Los_Angeles"),
+            ))),
             vec![
                 col("left"),
                 col("right"),
@@ -8162,6 +8165,19 @@ mod tests {
         let decoded = round_trip_expr(&physical, &schema)?;
 
         assert_eq!(as_hof(&decoded)?.name(), "map_zip_with");
+        let encoded_udf = super::super::encode::try_encode_higher_order_udf(as_hof(&physical)?)?;
+        let decoded_udf = super::super::decode::try_decode_higher_order_udf(&encoded_udf)?;
+        let decoded_udf_inner = decoded_udf.inner();
+        let Some(decoded_map_zip_with) =
+            (decoded_udf_inner.as_ref() as &dyn Any).downcast_ref::<SparkMapZipWith>()
+        else {
+            return plan_err!("decoded UDF is not map_zip_with");
+        };
+        assert!(!decoded_map_zip_with.ansi_mode());
+        assert_eq!(
+            decoded_map_zip_with.session_timezone(),
+            "America/Los_Angeles"
+        );
         assert_same_result(
             &physical,
             &decoded,

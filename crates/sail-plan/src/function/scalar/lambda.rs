@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 use datafusion_common::arrow::compute::can_cast_types;
 use datafusion_common::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter};
-use datafusion_common::{DFSchema, ScalarValue, plan_err};
+use datafusion_common::{DFSchema, DFSchemaRef, ScalarValue, plan_err};
 use datafusion_expr::expr::{HigherOrderFunction, Lambda, LambdaVariable};
 use datafusion_expr::{
     ExprSchemable, HigherOrderUDF, LambdaParametersProgress, ValueOrLambda, expr, lit,
@@ -86,9 +86,6 @@ static SPARK_ARRAY_SORT_SWAPPED_UDF: LazyLock<Arc<HigherOrderUDF>> =
 static SPARK_ARRAY_ZIP_WITH_UDF: LazyLock<Arc<HigherOrderUDF>> =
     LazyLock::new(|| Arc::new(HigherOrderUDF::new_from_impl(SparkArrayZipWith::new())));
 
-static SPARK_MAP_ZIP_WITH_UDF: LazyLock<Arc<HigherOrderUDF>> =
-    LazyLock::new(|| Arc::new(HigherOrderUDF::new_from_impl(SparkMapZipWith::new())));
-
 pub(crate) fn is_higher_order_function(name: &str) -> bool {
     matches!(
         name.trim().to_lowercase().as_str(),
@@ -114,11 +111,19 @@ pub(crate) fn is_higher_order_function(name: &str) -> bool {
 pub(crate) fn get_lambda_parameters(
     function_name: &str,
     fields: &[ValueOrLambda<FieldRef, Option<FieldRef>>],
+    ansi_mode: bool,
+    session_timezone: &str,
 ) -> PlanResult<Vec<Vec<FieldRef>>> {
-    let udf = match function_name.trim().to_lowercase().as_str() {
+    let normalized_function_name = function_name.trim().to_lowercase();
+    let map_zip_with_udf = Arc::new(HigherOrderUDF::new_from_impl(SparkMapZipWith::new(
+        ansi_mode,
+        Arc::from(session_timezone),
+    )));
+    let udf: &Arc<HigherOrderUDF> = match normalized_function_name.as_str() {
         "aggregate" | "reduce" => &SPARK_ARRAY_AGGREGATE_UDF,
         "filter" => &SPARK_ARRAY_FILTER_UDF,
         "map_filter" => &SPARK_MAP_FILTER_UDF,
+        "map_zip_with" => &map_zip_with_udf,
         "transform_keys" => &SPARK_TRANSFORM_KEYS_UDF,
         "transform_values" => &SPARK_TRANSFORM_VALUES_UDF,
         "transform" => &SPARK_ARRAY_TRANSFORM_UDF,
@@ -126,7 +131,6 @@ pub(crate) fn get_lambda_parameters(
         "forall" => &SPARK_ARRAY_FORALL_UDF,
         "array_sort" => &SPARK_ARRAY_SORT_UDF,
         "zip_with" => &SPARK_ARRAY_ZIP_WITH_UDF,
-        "map_zip_with" => &SPARK_MAP_ZIP_WITH_UDF,
         other => {
             return Err(PlanError::internal(format!(
                 "not a higher-order function: {other}"
@@ -430,6 +434,42 @@ fn expect_lambda_arity(role: &str, expr: &expr::Expr, arity: usize) -> PlanResul
     Ok(())
 }
 
+fn bind_zip_function(
+    name: &str,
+    mut left: expr::Expr,
+    mut right: expr::Expr,
+    mut function: expr::Expr,
+    schema: &DFSchemaRef,
+    parameter_names: &[&str],
+    null_input_type: DataType,
+) -> PlanResult<(expr::Expr, expr::Expr, expr::Expr)> {
+    if !matches!(&function, expr::Expr::Lambda(_)) {
+        for input in [&mut left, &mut right] {
+            if input.get_type(schema.as_ref())? == DataType::Null {
+                validate_map_filter_null_expr(input, schema)?;
+                *input = lit(ScalarValue::try_new_null(&null_input_type)?);
+            }
+        }
+        let params = parameter_names
+            .iter()
+            .map(|base| {
+                let mut parameter = (*base).to_owned();
+                while lambda_body_uses_param(&function, &parameter)? {
+                    parameter.push('_');
+                }
+                Ok(parameter)
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        function = expr::Expr::Lambda(Lambda::new(params, function));
+    }
+    expect_lambda_arity(name, &function, parameter_names.len())?;
+    Ok((left, right, function))
+}
+
+fn untyped_null_array_type() -> DataType {
+    DataType::List(Arc::new(Field::new_list_field(DataType::Null, true)))
+}
+
 fn aggregate(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {
     let args = input.arguments;
     let (array, zero, merge, finish) = match args.len() {
@@ -581,19 +621,41 @@ pub(super) fn list_built_in_lambda_functions() -> Vec<(&'static str, ScalarFunct
 }
 
 fn zip_with(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {
-    let (left, right, lambda) = input.arguments.three()?;
-    expect_lambda_arity("zip_with", &lambda, 2)?;
+    let (left, right, function) = input.arguments.three()?;
+    let (left, right, function) = bind_zip_function(
+        "zip_with",
+        left,
+        right,
+        function,
+        input.function_context.schema,
+        &["__zip_left", "__zip_right"],
+        untyped_null_array_type(),
+    )?;
     Ok(expr::Expr::HigherOrderFunction(HigherOrderFunction::new(
         Arc::clone(&SPARK_ARRAY_ZIP_WITH_UDF),
-        vec![left, right, lambda],
+        vec![left, right, function],
     )))
 }
 
 fn map_zip_with(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {
-    let (left, right, lambda) = input.arguments.three()?;
-    expect_lambda_arity("map_zip_with", &lambda, 3)?;
+    let (left, right, function) = input.arguments.three()?;
+    let (left, right, function) = bind_zip_function(
+        "map_zip_with",
+        left,
+        right,
+        function,
+        input.function_context.schema,
+        &[
+            "__map_zip_key",
+            "__map_zip_left_value",
+            "__map_zip_right_value",
+        ],
+        map_type_from_key_value_types(&DataType::Null, &DataType::Null),
+    )?;
+    let plan_config = input.function_context.plan_config;
+    let udf = SparkMapZipWith::new(plan_config.ansi_mode, plan_config.session_timezone_label());
     Ok(expr::Expr::HigherOrderFunction(HigherOrderFunction::new(
-        Arc::clone(&SPARK_MAP_ZIP_WITH_UDF),
-        vec![left, right, lambda],
+        Arc::new(HigherOrderUDF::new_from_impl(udf)),
+        vec![left, right, function],
     )))
 }
